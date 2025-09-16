@@ -31,7 +31,7 @@ TARGET = os.getenv("TG_TARGET", "@tipminer_bet_bot")
 
 # Supabase
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://dudpqqsguexasxbrvykn.supabase.co")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "SUA_CHAVE_AQUI")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImR1ZHBxcXNndWV4YXN4YnJ2eWtuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTc4OTUwOTYsImV4cCI6MjA3MzQ3MTA5Nn0.YTA9O0CUfrUpqXbRTQOb3IpcX0Fk3HyWjOFK23zM3zs")
 SUPABASE_TABLE = f"{SUPABASE_URL}/rest/v1/padroes"
 SUPABASE_HEADERS = {
     "apikey": SUPABASE_KEY,
