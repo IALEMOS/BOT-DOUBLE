@@ -1,9 +1,9 @@
 # collect.py
 # Bot de coleta para sinais do Telegram (Double/Blaze)
 # - pronto para Render (Background Worker)
-# - usa StringSession via variável de ambiente (fallback para arquivo se quiser)
-# - persiste WIN/LOSS no Supabase
-# - fuso horário: America/Rio_Branco
+# - usa StringSession via variável de ambiente (fallback para arquivo .session local)
+# - persiste padrão + WIN/LOSS no Supabase
+# - horários convertidos para America/Rio_Branco
 
 import os
 import re
@@ -15,23 +15,23 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 # ==========================
-# CONFIG (tudo por variáveis de ambiente no Render)
+# CONFIG (variáveis de ambiente)
 # ==========================
-API_ID  = int(os.getenv("TG_API_ID", "29224821"))  # ou defina no painel
+API_ID  = int(os.getenv("TG_API_ID", "29224821"))
 API_HASH = os.getenv("TG_API_HASH", "e02231dc424a5e8becd21762d185e3a9")
 
-# StringSession (recomendado no Render). Gere localmente e cole no painel.
+# StringSession (recomendado no Render)
 TG_STRING_SESSION = os.getenv("TG_STRING_SESSION", "").strip()
 
-# Fallback local (apenas se for rodar no PC com arquivo .session)
+# Fallback local (arquivo .session)
 SESSION_FILE = os.getenv("TG_SESSION", "BOT_DOUBLE")
 
 # ID numérico do chat/grupo OU @username (ex.: "@tipminer_bet_bot")
 TARGET = os.getenv("TG_TARGET", "@tipminer_bet_bot")
 
 # Supabase
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://dudpqqsguexasxbrvykn.supabase.co")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImR1ZHBxcXNndWV4YXN4YnJ2eWtuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTc4OTUwOTYsImV4cCI6MjA3MzQ3MTA5Nn0.YTA9O0CUfrUpqXbRTQOb3IpcX0Fk3HyWjOFK23zM3zs")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://SEU-PROJETO.supabase.co").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 SUPABASE_TABLE = f"{SUPABASE_URL}/rest/v1/padroes"
 SUPABASE_HEADERS = {
     "apikey": SUPABASE_KEY,
@@ -53,8 +53,8 @@ REG_PATTERNS = {
 
 def _rx(name: str):
     esc = re.escape(name)
-    esc = re.sub(r"\\\s\+", r"\\s+", esc)   # tolera múltiplos espaços
-    esc = esc.replace(r"\ ", r"\s*")        # espaço opcional
+    esc = re.sub(r"\\\s\+", r"\\s+", esc)  # tolera múltiplos espaços
+    esc = esc.replace(r"\ ", r"\s*")       # espaço opcional
     return re.compile(rf"\b{esc}\b", re.IGNORECASE)
 
 RX_PATTERNS = [(pid, name, _rx(name)) for pid, name in REG_PATTERNS.items()]
@@ -69,19 +69,35 @@ RE_ABORT = re.compile(r"\bABORTAD[OA]\b", re.I)
 RE_GALE  = re.compile(r"GALE\s*(\d+)", re.I)
 
 # ==========================
-# ESTADO
+# FUSO / TEMPO
 # ==========================
-threads = {}  # root_id -> {id_padrao, nome_padrao, gales, status, mensagens, ...}
-
-# fuso do Acre
 acre_tz = pytz.timezone("America/Rio_Branco")
 
-def iso_now():
-    """Retorna hora atual no fuso do Acre (ISO-8601 com offset)."""
-    return datetime.now(acre_tz).isoformat()
+def to_acre_iso(dt_utc: datetime) -> str:
+    """
+    Converte um datetime timezone-aware em UTC (como msg.date do Telegram)
+    para ISO-8601 no fuso America/Rio_Branco, incluindo offset.
+    """
+    if dt_utc.tzinfo is None:
+        # Telegram normalmente entrega tz-aware; este fallback é por segurança.
+        dt_utc = pytz.utc.localize(dt_utc)
+    return dt_utc.astimezone(acre_tz).isoformat()
+
+# ==========================
+# ESTADO
+# ==========================
+# threads[root_id] = {
+#   "id_padrao": int|None,
+#   "nome_padrao": str|None,
+#   "created_at": str (ISO Acre) | None,   # horário da raiz (ts)
+#   "gales": int,
+#   "status": "win"|"loss"|"aborted"|None,
+#   "mensagens": [ {id, texto, at(ISO)} ],
+# }
+threads = {}
 
 def find_pattern_in(texto: str):
-    """Retorna (id_padrao, nome_padrao) se achar na lista; senão (None, None)."""
+    """Retorna (id_padrao, nome_padrao) se achar; senão (None, None)."""
     if not texto:
         return (None, None)
     for pid, name, rx in RX_PATTERNS:
@@ -100,16 +116,17 @@ def terminal_event(texto: str):
 # ==========================
 def save_to_supabase(payload: dict):
     """
-    Insere 1 linha na tabela 'padroes' via REST.
-    payload: {id_padrao, nome_padrao, hora, win, loss, gale?, color?, root_id?}
+    Inserir 1 linha em 'padroes' via REST.
+    payload:
+      id_padrao, nome_padrao, hora(ts), outcome_hora(outcome_ts), win, loss, ...
     """
     body = {
         "pattern_id": payload["id_padrao"],
         "pattern_name": payload["nome_padrao"],
-        "ts": payload["hora"],           # já no fuso do Acre (string ISO-8601)
+        "ts": payload["hora"],                              # horário RAIZ (Acre)
+        "outcome_ts": payload.get("outcome_hora"),          # horário WIN/LOSS (Acre)
         "win": payload["win"],
         "loss": payload["loss"],
-        # opcionais — habilite quando tiver esses campos
         # "gale": payload.get("gale", 0),
         # "color": payload.get("color"),
         # "root_id": payload.get("root_id"),
@@ -129,7 +146,6 @@ def save_to_supabase(payload: dict):
 if TG_STRING_SESSION:
     client = TelegramClient(StringSession(TG_STRING_SESSION), API_ID, API_HASH)
 else:
-    # fallback local (arquivo). No Render, PREFIRA TG_STRING_SESSION.
     client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
 
 @client.on(events.NewMessage(chats=TARGET))
@@ -139,8 +155,10 @@ async def on_msg(event):
     mid   = msg.id
     rid   = msg.reply_to_msg_id
 
+    # horário desta mensagem (Acre) derivado de msg.date (UTC)
+    msg_ts_iso = to_acre_iso(msg.date)
+
     # ===== 1) Mensagem raiz? =====
-    # Heurística: contém “possível padrão identificado” OU já cita um nome conhecido
     root_like = (RE_HEADER_HINT.search(texto) is not None) or (find_pattern_in(texto)[0] is not None)
 
     if root_like and not rid:
@@ -152,13 +170,13 @@ async def on_msg(event):
         threads[mid] = {
             "id_padrao": id_padrao,
             "nome_padrao": nome_padrao,
-            "created_at": iso_now(),
+            "created_at": msg_ts_iso,   # horário da raiz (ts)
             "gales": 0,
             "status": None,
-            "mensagens": [{"id": mid, "texto": texto, "at": iso_now()}],
+            "mensagens": [{"id": mid, "texto": texto, "at": msg_ts_iso}],
         }
         print("\n" + "="*60)
-        print(f"[ROOT {mid}] padrão='{nome_padrao}' (id={id_padrao})")
+        print(f"[ROOT {mid}] padrão='{nome_padrao}' (id={id_padrao}) @ {msg_ts_iso}")
         print("="*60)
         return
 
@@ -169,18 +187,18 @@ async def on_msg(event):
             threads[root_id] = {
                 "id_padrao": None,
                 "nome_padrao": None,
-                "created_at": iso_now(),
+                "created_at": None,
                 "gales": 0,
                 "status": None,
                 "mensagens": [],
             }
 
         t = threads[root_id]
-        t["mensagens"].append({"id": mid, "texto": texto, "at": iso_now()})
+        t["mensagens"].append({"id": mid, "texto": texto, "at": msg_ts_iso})
         print(f"[RESPOSTA -> {root_id}] {texto}")
 
-        # backfill do nome/id a partir da raiz real
-        if t["id_padrao"] is None:
+        # backfill do nome/id e horário da raiz
+        if t["id_padrao"] is None or t.get("created_at") is None:
             try:
                 root_msg = await event.get_reply_message()
                 if root_msg:
@@ -188,9 +206,13 @@ async def on_msg(event):
                     pid, pname = find_pattern_in(rtext)
                     if pid is not None:
                         t["id_padrao"], t["nome_padrao"] = pid, pname
-                        if not any(m["id"] == root_msg.id for m in t["mensagens"]):
-                            t["mensagens"].insert(0, {"id": root_msg.id, "texto": rtext, "at": iso_now()})
-                        print(f"   ↳ backfill padrão='{pname}' (id={pid})")
+                    if t.get("created_at") is None:
+                        t["created_at"] = to_acre_iso(root_msg.date)
+                    if not any(m["id"] == root_msg.id for m in t["mensagens"]):
+                        t["mensagens"].insert(0, {
+                            "id": root_msg.id, "texto": rtext, "at": to_acre_iso(root_msg.date)
+                        })
+                    print(f"   ↳ backfill padrão='{t['nome_padrao']}' (id={t['id_padrao']}) @ {t['created_at']}")
             except Exception as e:
                 print(f"   ↳ backfill falhou: {e}")
 
@@ -207,6 +229,7 @@ async def on_msg(event):
         end = terminal_event(texto)
         if end:
             t["status"] = end
+            outcome_ts_iso = msg_ts_iso  # horário do resultado (WIN/LOSS)
 
             if end == "aborted":
                 print(f"[CLOSE {root_id}] ❌ abortado (não salva)\n")
@@ -218,13 +241,17 @@ async def on_msg(event):
                 del threads[root_id]
                 return
 
+            # usa horário real da raiz (se conhecido); senão, o do outcome
+            root_ts_iso = t.get("created_at") or outcome_ts_iso
+
             payload = {
                 "id_padrao": t["id_padrao"],
                 "nome_padrao": t["nome_padrao"],
-                "hora": iso_now(),                          # fuso Acre
+                "hora": root_ts_iso,            # → coluna ts
+                "outcome_hora": outcome_ts_iso, # → coluna outcome_ts
                 "win":  1 if end == "win"  else 0,
                 "loss": 1 if end == "loss" else 0,
-                # "gale": t["gales"],                       # habilite se quiser gravar
+                # "gale": t["gales"],
                 # "root_id": root_id,
             }
 
